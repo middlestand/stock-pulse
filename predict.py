@@ -13,77 +13,141 @@ PAIRS = [
 def clamp(val, min_v=-100, max_v=100):
     return max(min_v, min(max_v, int(round(val))))
 
-def get_tnx_diff():
+def fetch_df(ticker, period, interval):
+    df = yf.download(ticker, period=period, interval=interval, progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df.dropna(subset=["Close"])
+
+def calc_rsi(series, period=14):
+    if len(series) < period + 1:
+        return 50.0
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    last_loss = float(loss.iloc[-1])
+    last_gain = float(gain.iloc[-1])
+    if pd.isna(last_loss) or last_loss == 0:
+        return 100.0 if last_gain > 0 else 50.0
+    rs = last_gain / last_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def get_macro():
+    macro = {"tnx_1h": 0.0, "dxy_1h_pct": 0.0, "sp500_1h_pct": 0.0}
     try:
-        df = yf.download("^TNX", period="5d", interval="1h", progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.dropna(subset=["Close"])
-        if len(df) >= 2:
-            return float(df["Close"].iloc[-1]) - float(df["Close"].iloc[-2])
+        df_tnx = fetch_df("^TNX", "5d", "1h")
+        if len(df_tnx) >= 2:
+            macro["tnx_1h"] = float(df_tnx["Close"].iloc[-1]) - float(df_tnx["Close"].iloc[-2])
     except Exception:
         pass
-    return 0.0
+    try:
+        df_dxy = fetch_df("DX-Y.NYB", "5d", "1h")
+        if len(df_dxy) >= 2:
+            c0, c1 = float(df_dxy["Close"].iloc[-2]), float(df_dxy["Close"].iloc[-1])
+            if c0 != 0:
+                macro["dxy_1h_pct"] = ((c1 - c0) / c0) * 100
+    except Exception:
+        pass
+    try:
+        df_es = fetch_df("ES=F", "5d", "1h")
+        if len(df_es) >= 2:
+            c0, c1 = float(df_es["Close"].iloc[-2]), float(df_es["Close"].iloc[-1])
+            if c0 != 0:
+                macro["sp500_1h_pct"] = ((c1 - c0) / c0) * 100
+    except Exception:
+        pass
+    return macro
 
-def analyze_fx(info, dy_1h, now_jst):
+def analyze_fx(info, macro, now_jst):
     ticker = info["ticker"]
     digits = info["digits"]
+    key = info["key"]
 
-    df_1h = yf.download(ticker, period="7d", interval="1h", progress=False)
-    df_1d = yf.download(ticker, period="10d", interval="1d", progress=False)
+    df_1h = fetch_df(ticker, "7d", "1h")
+    df_1d = fetch_df(ticker, "10d", "1d")
+    try:
+        df_15m = fetch_df(ticker, "2d", "15m")
+    except Exception:
+        df_15m = pd.DataFrame()
 
-    if isinstance(df_1h.columns, pd.MultiIndex):
-        df_1h.columns = df_1h.columns.get_level_values(0)
-    if isinstance(df_1d.columns, pd.MultiIndex):
-        df_1d.columns = df_1d.columns.get_level_values(0)
-
-    df_1h = df_1h.dropna(subset=["Close"])
-    df_1d = df_1d.dropna(subset=["Close"])
-
-    current_price = float(df_1h["Close"].iloc[-1])
+    has_15m = len(df_15m) >= 3
+    current_price = float(df_15m["Close"].iloc[-1]) if has_15m else float(df_1h["Close"].iloc[-1])
     prev_close = float(df_1d["Close"].iloc[-2]) if len(df_1d) >= 2 else float(df_1d["Open"].iloc[-1])
 
     today_open = float(df_1d["Open"].iloc[-1])
     today_high = float(df_1d["High"].iloc[-1])
     today_low = float(df_1d["Low"].iloc[-1])
 
-    # 1. 前日終値比（日足の地合い）
+    # 通貨ペアごとの標準値幅（1時間ATR）を算出してボラティリティを均一化
+    atr = float((df_1h["High"] - df_1h["Low"]).tail(14).mean())
+    if pd.isna(atr) or atr <= 0:
+        atr = current_price * 0.002
+
+    # 1. 上位足（日足＋1時間EMA20）の地合い
     diff = current_price - prev_close
     diff_pct = (diff / prev_close) * 100 if prev_close else 0.0
-    score_day = clamp(diff_pct * 95)
+    ema20_1h = float(df_1h["Close"].tail(20).mean())
+
+    day_norm = diff / (atr * 3.0)
+    ema_norm = (current_price - ema20_1h) / atr
+    score_day = clamp(day_norm * 35 + ema_norm * 35)
+
     day_label = "買い優勢" if score_day >= 20 else ("売り優勢" if score_day <= -20 else "拮抗")
     day_desc = (
-        "前日終値を上回って推移。本日の地合いは買い方向が優勢です。"
-        if diff >= 0 else
-        "前日終値を下回って推移。本日の地合いは売り方向が優勢です。"
+        "日足・1時間移動平均ともに上向き。上位足のトレンドが買いを支えています。"
+        if score_day >= 15 else (
+            "日足・1時間移動平均ともに下向き。上位足の売り圧力が優勢です。"
+            if score_day <= -15 else
+            "前日比と短期移動平均の方向が交錯しており、方向感を探る展開です。"
+        )
     )
 
-    # 2. 直近1時間の勢い ＋ 移動平均（EMA20）との位置
-    p_1h = float(df_1h["Close"].iloc[-2]) if len(df_1h) >= 2 else current_price
-    mom_1h = current_price - p_1h
-    mom_1h_pct = (mom_1h / p_1h) * 100 if p_1h else 0.0
-    ema20 = float(df_1h["Close"].tail(20).mean())
-    gap_pct = ((current_price - ema20) / ema20) * 100 if ema20 else 0.0
-
-    # 離れすぎ（過熱）の反落警戒補正
-    if gap_pct > 0.45:
-        gap_score = -15
-    elif gap_pct < -0.45:
-        gap_score = 15
+    # 2. 15分足の初動 ＋ RSI過熱ブレーキ
+    if has_15m:
+        p_prev = float(df_15m["Close"].iloc[-3])  # 直近30分の変化
+        mom_short = current_price - p_prev
+        mom_norm = mom_short / (atr * 0.6)
+        mom_label_txt = "直近30分"
     else:
-        gap_score = gap_pct * 60
+        p_prev = float(df_1h["Close"].iloc[-2]) if len(df_1h) >= 2 else current_price
+        mom_short = current_price - p_prev
+        mom_norm = mom_short / atr
+        mom_label_txt = "直近1時間"
 
-    score_1h = clamp(mom_1h_pct * 160 + gap_score)
-    trend_label = "上昇基調" if score_1h >= 20 else ("下落基調" if score_1h <= -20 else "横ばい")
-    trend_desc = (
-        "短期移動平均を上回り、2時間後まで続きやすい初動が出ています。"
-        if current_price >= ema20 else
-        "短期移動平均を下回り、上値の重い推移が続いています。"
-    )
+    rsi_1h = calc_rsi(df_1h["Close"], 14)
+    if rsi_1h >= 72:
+        rsi_adj = -25
+        rsi_note = f"RSI({rsi_1h:.0f})が買われすぎ水準のため反落を警戒。"
+    elif rsi_1h <= 28:
+        rsi_adj = 25
+        rsi_note = f"RSI({rsi_1h:.0f})が売られすぎ水準のため反発を警戒。"
+    else:
+        rsi_adj = (rsi_1h - 50.0) * 0.45
+        rsi_note = f"RSI({rsi_1h:.0f})は過熱感のない健全な水準です。"
 
-    # 3. 米国10年債利回りの先行シグナル ＋ 時間帯フィルター
-    rate_dir = -1 if info["key"] == "EURUSD" else 1
-    score_macro = clamp(dy_1h * 900 * rate_dir)
+    score_1h = clamp(mom_norm * 45 + rsi_adj)
+    trend_label = "上昇初動" if score_1h >= 20 else ("下落初動" if score_1h <= -20 else "横ばい")
+    trend_desc = f"{mom_label_txt}の値動き({mom_short:+.{digits}f})を分析。{rsi_note}"
+
+    # 3. 3つの外部マクロ指標（米10年債金利・ドル指数DXY・米国株S&P500先物）＋ 時間帯
+    tnx = macro["tnx_1h"]
+    dxy = macro["dxy_1h_pct"]
+    sp500 = macro["sp500_1h_pct"]
+
+    if key == "USDJPY":
+        raw_macro = tnx * 600 + dxy * 120 + sp500 * 40
+        macro_metric = f"米金利{tnx:+.3f}% / DXY{dxy:+.2f}%"
+    elif key == "EURUSD":
+        raw_macro = -tnx * 500 - dxy * 150
+        macro_metric = f"DXY{dxy:+.2f}% / 米金利{tnx:+.3f}%"
+    elif key == "GBPJPY":
+        raw_macro = tnx * 500 + sp500 * 75 + dxy * 50
+        macro_metric = f"米株{sp500:+.2f}% / 米金利{tnx:+.3f}%"
+    else:  # AUDJPY
+        raw_macro = sp500 * 115 + tnx * 450
+        macro_metric = f"米株{sp500:+.2f}% / 米金利{tnx:+.3f}%"
+
+    score_macro = clamp(raw_macro)
     macro_label = "追い風" if score_macro >= 20 else ("逆風" if score_macro <= -20 else "中立")
 
     h = now_jst.hour
@@ -92,21 +156,35 @@ def analyze_fx(info, dy_1h, now_jst):
 
     if is_weekend:
         time_note = "【週末休場中】"
-        time_mult = 0.3
-    elif h in {9, 16, 17, 21, 22}:
-        time_note = "流動性が高くトレンドが出やすい時間帯です。"
-        time_mult = 1.2
+        time_mult = 0.25
+    elif h in {9, 16, 17, 21, 22, 23}:
+        time_note = "大口資金が入りトレンドが続きやすい時間帯です。"
+        time_mult = 1.15
     elif h in {5, 6, 7, 12, 13, 14}:
-        time_note = "値動きが停滞・反転しやすい時間帯です。"
-        time_mult = 0.6
+        time_note = "流動性が低くダマシが出やすい時間帯です。"
+        time_mult = 0.65
     else:
         time_note = "標準的な市場流動性の時間帯です。"
         time_mult = 1.0
 
-    macro_desc = f"米10年債金利の直近変化({dy_1h:+.3f}%)を加味。{time_note}"
+    # 3要素の一致度（コンフルエンス）判定
+    scores = [score_day, score_1h, score_macro]
+    bull_cnt = sum(1 for s in scores if s >= 15)
+    bear_cnt = sum(1 for s in scores if s <= -15)
 
-    # 総合スコア算出（ダマシを減らすため ±35点以上を明確なシグナルとする）
-    raw_total = (score_day * 0.35 + score_1h * 0.40 + score_macro * 0.25) * time_mult
+    if bull_cnt == 3 or bear_cnt == 3:
+        conf_mult = 1.25
+        conf_note = "3要素すべて同方向へ一致。"
+    elif (bull_cnt == 2 and bear_cnt == 0) or (bear_cnt == 2 and bull_cnt == 0):
+        conf_mult = 1.0
+        conf_note = "2要素が同方向へ一致。"
+    else:
+        conf_mult = 0.65
+        conf_note = "指標間で方向が割れているため慎重判定。"
+
+    macro_desc = f"{conf_note}{time_note}"
+
+    raw_total = (score_day * 0.35 + score_1h * 0.35 + score_macro * 0.30) * conf_mult * time_mult
     total_score = clamp(raw_total)
 
     if total_score >= 35:
@@ -116,16 +194,12 @@ def analyze_fx(info, dy_1h, now_jst):
     else:
         signal = "様子見"
 
-    atr = float((df_1h["High"] - df_1h["Low"]).tail(14).mean())
-    if pd.isna(atr) or atr == 0:
-        atr = current_price * 0.002
     range_low = round(current_price - atr * 0.7, digits)
     range_high = round(current_price + atr * 1.3 if total_score >= 0 else current_price + atr * 0.7, digits)
-
     chart_prices = [round(float(x), digits) for x in df_1h["Close"].tail(15).tolist()]
 
     return {
-        "key": info["key"],
+        "key": key,
         "name": info["name"],
         "code": info["code"],
         "unit": info["unit"],
@@ -143,24 +217,24 @@ def analyze_fx(info, dy_1h, now_jst):
         "chart_prices": chart_prices,
         "reasons": [
             {
-                "title": "前日終値比の地合い",
+                "title": "上位足の地合い（日足・EMA）",
                 "badge": day_label,
                 "desc": day_desc,
                 "metric": f"{diff:+.{digits}f} ({diff_pct:+.2f}%)",
                 "score": score_day
             },
             {
-                "title": "直近1時間のトレンド",
+                "title": "15分足初動・RSI過熱判定",
                 "badge": trend_label,
                 "desc": trend_desc,
-                "metric": f"{mom_1h:+.{digits}f} (直近1時間)",
+                "metric": f"{mom_short:+.{digits}f} / RSI {rsi_1h:.0f}",
                 "score": score_1h
             },
             {
-                "title": "米金利・時間帯の追い風",
+                "title": "米金利・ドル・株の連動性",
                 "badge": "休場中" if is_weekend else macro_label,
                 "desc": macro_desc,
-                "metric": f"米10年債 {dy_1h:+.3f}%",
+                "metric": macro_metric,
                 "score": score_macro
             }
         ]
@@ -172,12 +246,12 @@ def main():
     h_start = (now + timedelta(hours=2)).strftime("%H:%M")
     h_end = (now + timedelta(hours=3)).strftime("%H:%M")
 
-    dy_1h = get_tnx_diff()
+    macro = get_macro()
 
     fx_data = {}
     for item in PAIRS:
         try:
-            fx_data[item["key"]] = analyze_fx(item, dy_1h, now)
+            fx_data[item["key"]] = analyze_fx(item, macro, now)
         except Exception as e:
             print(f"Error {item['key']}: {e}")
 
